@@ -1,0 +1,8 @@
+{
+  "name": "yaesu-ftx1-cat",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "serialport": "^12.0.0"
+  }
+}

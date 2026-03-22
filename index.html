@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FTX-1 Memory Programmer</title>
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>FTX-1 Memory Programmer</h1>
+        </header>
+
+        <section class="controls">
+            <div class="control-row">
+                <div class="control-group">
+                    <label for="connectBtn">Radio:</label>
+                    <button id="connectBtn" class="btn btn-primary">Connect to Radio</button>
+                    <span id="connectionStatus" class="status-disconnected">Not connected</span>
+                </div>
+                <div class="control-group">
+                    <label for="startMem">Start Memory:</label>
+                    <input type="number" id="startMem" value="1" min="1" max="999">
+                </div>
+            </div>
+
+            <div class="control-row">
+                <div class="control-group file-input">
+                    <label for="csvFile">Load CSV:</label>
+                    <input type="file" id="csvFile" accept=".csv">
+                    <div class="radio-group">
+                        <label><input type="radio" name="csvFormat" value="chirp"> CHIRP</label>
+                        <label><input type="radio" name="csvFormat" value="repeater" checked> relais.dl3el.de</label>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="summary" id="summarySection">
+            <div class="summary-item">
+                <span class="summary-label">Entries:</span>
+                <span class="summary-value" id="totalEntries">0</span>
+            </div>
+            <div class="summary-item">
+                <span class="summary-label">Valid:</span>
+                <span class="summary-value" id="validEntries">0</span>
+            </div>
+            <div class="summary-item">
+                <span class="summary-label">Skipped:</span>
+                <span class="summary-value" id="skippedEntries">0</span>
+            </div>
+        </section>
+
+        <section class="entries-table">
+            <div class="table-header">
+                <span class="col-num">#</span>
+                <span class="col-name">Name</span>
+                <span class="col-loc">Location</span>
+                <span class="col-freq">Frequency</span>
+                <span class="col-shift">Shift</span>
+                <span class="col-mode">Mode</span>
+                <span class="col-tone">Tone</span>
+                <span class="col-status">Status</span>
+            </div>
+            <div class="table-body" id="entriesBody">
+                <div class="empty-message">No entries loaded. Select a CSV file above.</div>
+            </div>
+        </section>
+
+        <section class="actions">
+            <button id="uploadBtn" class="btn btn-success btn-large" disabled>Upload to Radio</button>
+        </section>
+
+        <section class="log-section">
+            <div class="log-header">
+                <span>Log</span>
+                <button id="clearLogBtn" class="btn btn-small">Clear</button>
+            </div>
+            <div class="log-content" id="logContent"></div>
+        </section>
+    </div>
+
+    <script type="module">
+        import { Ftx1UploaderCore, FTX1_SUPPORTED_MODES } from './js/Ftx1UploaderCore.js';
+        import { WebSerial } from './js/SerialInterface.js';
+        import CsvParser from './js/CsvParser.js';
+        import { isFrequencySupported } from './js/constants.js';
+
+        // State
+        let entries = [];
+        let webSerialInstance = null;
+        let connected = false;
+        let uploading = false;
+
+        // DOM elements
+        const connectBtn = document.getElementById('connectBtn');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const startMemInput = document.getElementById('startMem');
+        const csvFileInput = document.getElementById('csvFile');
+        const csvFormatRadios = document.getElementsByName('csvFormat');
+        const summarySection = document.getElementById('summarySection');
+        const totalEntriesEl = document.getElementById('totalEntries');
+        const validEntriesEl = document.getElementById('validEntries');
+        const skippedEntriesEl = document.getElementById('skippedEntries');
+        const entriesBody = document.getElementById('entriesBody');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const logContent = document.getElementById('logContent');
+        const clearLogBtn = document.getElementById('clearLogBtn');
+
+        // Get selected CSV format
+        function getSelectedFormat() {
+            for (const radio of csvFormatRadios) {
+                if (radio.checked) return radio.value;
+            }
+            return 'repeater';
+        }
+
+        // Log message
+        function log(message, type = 'info') {
+            const time = new Date().toLocaleTimeString();
+            const line = document.createElement('div');
+            line.className = `log-line log-${type}`;
+            line.textContent = `${time}  ${message}`;
+            logContent.appendChild(line);
+            logContent.scrollTop = logContent.scrollHeight;
+        }
+
+        // Clear log
+        function clearLog() {
+            logContent.innerHTML = '';
+        }
+
+        // Update summary display
+        function updateSummary() {
+            totalEntriesEl.textContent = entries.length;
+
+            let valid = 0;
+            let skipped = 0;
+
+            entries.forEach(entry => {
+                if (entry.skipped) {
+                    skipped++;
+                } else {
+                    valid++;
+                }
+            });
+
+            validEntriesEl.textContent = valid;
+            skippedEntriesEl.textContent = skipped;
+        }
+
+        // Get shift/duplex display
+        function getShiftDisplay(entry) {
+            // Check Duplex field (CHIRP format)
+            if (entry.Duplex === '+') return '+';
+            if (entry.Duplex === '-') return '-';
+            // Check offsetDirection (repeater CSV format)
+            if (entry.offsetDirection === 'PLUS') return '+';
+            if (entry.offsetDirection === 'MINUS') return '-';
+            return '';
+        }
+
+        // Render entries table
+        function renderEntries() {
+            if (entries.length === 0) {
+                entriesBody.innerHTML = '<div class="empty-message">No entries loaded. Select a CSV file above.</div>';
+                return;
+            }
+
+            entriesBody.innerHTML = '';
+
+            // Count valid (non-skipped) entries to assign memory numbers sequentially
+            let validCount = 0;
+            const startMem = parseInt(startMemInput.value) || 1;
+
+            entries.forEach((entry) => {
+                const row = document.createElement('div');
+                row.className = `table-row ${entry.skipped ? 'row-skipped' : ''}`;
+
+                // Only assign memory numbers to non-skipped entries
+                let memNum = '';
+                if (!entry.skipped) {
+                    memNum = entry.memoryNumber || (startMem + validCount);
+                    validCount++;
+                }
+                const freq = entry.Frequency || (entry.rxFreq ? (entry.rxFreq / 1000000).toFixed(5) : '0');
+                const mode = (entry.Mode || entry.mode || 'FM').toUpperCase();
+                const shift = getShiftDisplay(entry);
+                // Digital modes (DN/C4FM) don't use CTCSS tone
+                const tone = (mode === 'DN' || mode === 'C4FM') ? '-' : (entry.Tone || (entry.toneMode === 'TONE' ? `${entry.ctcssTone} Hz` : '-'));
+                const status = entry.skipped ? '⊘ SKIP' : '✓ OK';
+                const location = entry.Info || entry.qth || entry.Comment || '';
+
+                row.innerHTML = `
+                    <span class="col-num">${memNum}</span>
+                    <span class="col-name" title="${entry.Name || entry.name || ''}">${entry.Name || entry.name || '-'}</span>
+                    <span class="col-loc" title="${location}">${location}</span>
+                    <span class="col-freq">${freq}</span>
+                    <span class="col-shift">${shift}</span>
+                    <span class="col-mode">${mode}</span>
+                    <span class="col-tone">${tone}</span>
+                    <span class="col-status">${status}</span>
+                `;
+
+                entriesBody.appendChild(row);
+            });
+
+            updateSummary();
+        }
+
+        // Parse CSV file
+        async function parseFile(file) {
+            const text = await file.text();
+            const format = getSelectedFormat();
+            const parser = new CsvParser();
+
+            let parsed = [];
+            if (format === 'chirp') {
+                parsed = parser.parseChirpCsv(text, { supportedModes: FTX1_SUPPORTED_MODES });
+            } else {
+                const CharConverter = (await import('./js/CharConverter.js')).default;
+                parsed = parser.parseRepeaterCsv(text, new CharConverter(), { supportedModes: FTX1_SUPPORTED_MODES });
+            }
+
+            // Validate frequencies
+            entries = parsed.map(entry => {
+                // For CHIRP: Frequency is in MHz as string
+                // For repeater CSV: rxFreq is in Hz as number
+                let freqHz = 0;
+                if (entry.rxFreq) {
+                    freqHz = entry.rxFreq;
+                } else if (entry.Frequency) {
+                    freqHz = parseFloat(entry.Frequency) * 1000000;
+                }
+
+                let freqMHz = 0;
+                if (entry.rxFreq) {
+                    freqMHz = entry.rxFreq / 1000000;
+                } else if (entry.Frequency) {
+                    freqMHz = parseFloat(entry.Frequency);
+                }
+
+                if (freqHz > 0 && !isFrequencySupported(freqHz)) {
+                    return { ...entry, skipped: true, skipReason: `Frequency ${freqMHz.toFixed(3)} MHz not supported` };
+                }
+                return { ...entry, skipped: false };
+            });
+
+            log(`Loaded ${entries.length} entries from ${file.name}`);
+            renderEntries();
+
+            // Enable upload button if connected and has valid entries
+            uploadBtn.disabled = !connected || entries.filter(e => !e.skipped).length === 0;
+        }
+
+        // Connect to radio via Web Serial
+        async function connect() {
+            try {
+                log('Requesting port access...');
+                webSerialInstance = new WebSerial();
+                await webSerialInstance.connect();
+
+                connected = true;
+                connectionStatus.textContent = 'Connected';
+                connectionStatus.className = 'status-connected';
+                connectBtn.textContent = 'Disconnect';
+                connectBtn.classList.remove('btn-primary');
+                connectBtn.classList.add('btn-secondary');
+
+                log('Connected to FTX-1');
+
+                // Enable upload if entries loaded
+                uploadBtn.disabled = entries.filter(e => !e.skipped).length === 0;
+
+            } catch (err) {
+                log(`Connection failed: ${err.message}`, 'error');
+                connected = false;
+                webSerialInstance = null;
+            }
+        }
+
+        // Disconnect from radio
+        async function disconnect() {
+            try {
+                if (webSerialInstance) {
+                    await webSerialInstance.close();
+                    webSerialInstance = null;
+                }
+                connected = false;
+                connectionStatus.textContent = 'Not connected';
+                connectionStatus.className = 'status-disconnected';
+                connectBtn.textContent = 'Connect to Radio';
+                connectBtn.classList.remove('btn-secondary');
+                connectBtn.classList.add('btn-primary');
+                uploadBtn.disabled = true;
+                log('Disconnected from FTX-1');
+            } catch (err) {
+                log(`Disconnect failed: ${err.message}`, 'error');
+            }
+        }
+
+        // Upload entries to radio
+        async function upload() {
+            if (!connected || !webSerialInstance || uploading) {
+                if (!connected) log('Not connected to radio', 'error');
+                return;
+            }
+
+            uploading = true;
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'Uploading...';
+
+            const uploader = new Ftx1UploaderCore(webSerialInstance);
+
+            // Wrap execute to capture sent/received commands in log
+            const originalExecute = uploader.execute.bind(uploader);
+            uploader.execute = async (cmd, expectResponse = true) => {
+                if (cmd) {
+                    log(`>>> ${cmd};`, 'sent');
+                }
+                try {
+                    const result = await originalExecute(cmd, expectResponse);
+                    if (result) {
+                        log(`<<< ${result};`, 'received');
+                    }
+                    return result;
+                } catch (err) {
+                    log(`Error: ${err.message}`, 'error');
+                    throw err;
+                }
+            };
+
+            const startMem = parseInt(startMemInput.value) || 1;
+            const validEntries = entries.filter(e => !e.skipped);
+
+            log(`Starting upload of ${validEntries.length} entries (from memory ${startMem})...`);
+
+            try {
+                await uploader.uploadEntries(validEntries, {
+                    startMem: startMem,
+                    onProgress: (progress) => {
+                        if (progress.message) {
+                            log(progress.message);
+                        }
+                    }
+                });
+
+                log('Upload complete!', 'success');
+
+            } catch (err) {
+                log(`Upload failed: ${err.message}`, 'error');
+            } finally {
+                uploading = false;
+                uploadBtn.textContent = 'Upload to Radio';
+                uploadBtn.disabled = !connected || validEntries.length === 0;
+            }
+        }
+
+        // Event listeners
+        connectBtn.addEventListener('click', () => {
+            if (connected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        });
+
+        csvFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                parseFile(file);
+            }
+        });
+
+        csvFormatRadios.forEach(radio => {
+            radio.addEventListener('change', () => {
+                if (csvFileInput.files[0]) {
+                    parseFile(csvFileInput.files[0]);
+                }
+            });
+        });
+
+        // Re-render entries when startMem changes (to update memory numbers)
+        startMemInput.addEventListener('change', () => {
+            renderEntries();
+        });
+
+        uploadBtn.addEventListener('click', upload);
+        clearLogBtn.addEventListener('click', clearLog);
+
+        // Initial state
+        log('FTX-1 Memory Programmer ready');
+        log('Connect to your radio and load a CSV file to begin');
+    </script>
+</body>
+</html>
