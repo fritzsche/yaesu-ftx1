@@ -49,6 +49,18 @@ header h1 {
     font-weight: 600;
 }
 
+header .subtitle {
+    font-size: 12px;
+    font-weight: normal;
+    margin-top: 4px;
+    opacity: 0.8;
+}
+
+header .subtitle a {
+    color: #fff;
+    text-decoration: underline;
+}
+
 section {
     padding: 16px 20px;
     border-bottom: 1px solid var(--border);
